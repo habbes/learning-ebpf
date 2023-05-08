@@ -3,6 +3,8 @@ from bcc import BPF
 
 program = r"""
 int hello(void *ctx) {
+    // Writes the trace message to the pseudo-file:
+    // /sys/kernel/debug/tracing/trace_pipe
     bpf_trace_printk("Hello World!");
     return 0;
 }
