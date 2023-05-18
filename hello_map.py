@@ -35,6 +35,10 @@ int count_by_uid(void *ctx)
 b = BPF(text=program)
 syscall = b.get_syscall_fnname("execve")
 b.attach_kprobe(event=syscall, fn_name="count_by_uid")
+syscall = b.get_syscall_fnname("openat")
+b.attach_kprobe(event=syscall, fn_name="count_by_uid")
+syscall = b.get_syscall_fnname("write")
+b.attach_kprobe(event=syscall, fn_name="count_by_uid")
 
 while True:
     sleep(2)
