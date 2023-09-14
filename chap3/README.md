@@ -159,3 +159,250 @@ bpf_prog_4ae0216d65106432_hello:
 ```
 
 ## Attaching to an event
+
+The program type has to match the type of event it's being attached to. Here's an example
+attaching out XDP program to an XDP event on a network interface:
+
+```
+bpftool net attach xdp id 540 dev eth0
+```
+
+PS: to list network interfaces and their details, you can use the `ip addr` or `ip link show` commands.
+
+You can view all network-attached eBPF programs using:
+
+```
+bpftool net list
+```
+
+```
+xdp:
+ens33(2) generic id 49
+
+tc:
+
+flow_dissector:
+
+netfilter:
+```
+
+The program with id 49 is attached to the XDP event on the `ens33` interface.
+
+You can also inspect the network interface using `ip link`. The output looks like:
+
+```
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+2: ens33: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 xdpgeneric qdisc fq_codel state UP mode DEFAULT group default qlen 1000
+    link/ether 00:0c:29:ed:5f:c8 brd ff:ff:ff:ff:ff:ff
+    prog/xdp id 49 tag 4ae0216d65106432 jited 
+    altname enp2s1
+```
+
+In this example `lo` is the loopback interface (localhost) and `ens33` is used to connect to the outside world.
+`ens33` has a JIT-compiled eBPF program with id 49 and tag `4ae0216d65106432` attached to its XDP hook. You can also use
+`ip link` to attach and detach XDP programs.
+
+
+Now we should be able to see trace output from the `hello` program every time a network packet is received:
+
+```
+cat /sys/kernel/debug/tracing/trace_pipe
+```
+
+If you can't remember the location of the trace pipe, you can use the command: `bpftool prog tracelog`
+
+
+Output looks like:
+
+```
+ksoftirqd/1-23      [001] d.s21  2970.826738: bpf_trace_printk: Hello World 1039
+ksoftirqd/1-23      [001] d.s21  2970.826918: bpf_trace_printk: Hello World 1040
+ksoftirqd/1-23      [001] d.s21  2970.827034: bpf_trace_printk: Hello World 1041
+    <idle>-0       [001] d.s31  2971.107402: bpf_trace_printk: Hello World 1042
+    <idle>-0       [001] d.s31  2971.387727: bpf_trace_printk: Hello World 1043
+    <idle>-0       [001] d.s31  2971.388720: bpf_trace_printk: Hello World 1044
+    <idle>-0       [001] d.s31  2971.390576: bpf_trace_printk: Hello World 1045
+```
+
+We see `<idle>-0` instead of a process id associated with these events because these events
+were not triggered by a process. The XDP event results from the arrival of a network packet,
+at that point the system hasn't done anything with the packet other than receive it in memory,
+and it has no idea what the packet is or where it's going.
+
+
+## Global Variables
+
+eBPF maps can be accessed from an eBPF and user space. Multiple runs of an eBPF program
+can access the same map instance. This makes it ideal for global state. As a result,
+map semantics are used to support features like global variables.
+
+Behind the scenes, a global variable like `counter` in our sample program is stored
+as a map entry.
+
+To list eBPF maps, use the command:
+
+```
+bpftool map list
+```
+
+```
+165: array  name hello.bss  flags 0x400
+        key 4B  value 4B  max_entries 1  memlock 4096B
+        btf_id 254
+166: array  name hello.rodata  flags 0x80
+        key 4B  value 15B  max_entries 1  memlock 4096B
+        btf_id 254  frozen
+```
+
+A bss section in a object file from a C program typically holds global variables.
+You can see its content using
+
+```
+bpftool map dump name hello.bss
+```
+You can also use the id: `bpftool map dump id 165`
+
+```
+[{
+        "value": {
+            ".bss": [{
+                    "counter": 11127
+                }
+            ]
+        }
+    }
+]
+```
+
+This type of pretty-printed output that shows the contents of the map including key names is
+possible only if BTF-information is available, i.e. program was compiled with the `-g` flag.
+If you omit the flag, the output would look more like:
+
+```
+key: 00 00 00 00  value: 19 01 00 00
+Found 1 element
+```
+
+We can't tell the variable name in this case, but can infer that we have one entry
+with the value `19 01 00 00` which is `281` in decimal (little-endian).
+
+Maps are also used to hold static data, like string literals.
+
+```
+bpftool map dump id 166
+```
+
+```
+[{
+        "value": {
+            ".rodata": [{
+                    "hello.____fmt": "Hello World %d"
+                }
+            ]
+        }
+    }
+]
+```
+
+Of, if you didn't use the `-g` flag:
+
+```
+key: 00 00 00 00  value: 48 65 6c 6c 6f 20 57 6f  72 6c 64 20 25 64 00
+Found 1 element
+```
+
+The value is the ASCII representaton of the string `"Hello World %d"`.
+
+## Detaching the Program
+
+To detach the program from the network interface:
+
+```
+bpftool net detach xdp dev ens33
+```
+
+Then run the following command to verify that the program has been detached:
+
+```
+bpftool net list
+```
+
+## Unloading the program
+
+To unload the program, delete the pinned pseudofile:
+
+```
+rm /sys/fs/bpf/hello
+```
+
+Then run the following command to ensure the program is unloaded:
+```
+bpftool prog show name hello
+```
+
+## BPF to BPF calls
+
+Besides tail calls (where we add BPF program descriptors in a map to be able to call them from
+other BPF programs), you can also make BPF to BPF calls by calling functions from a BPF program.
+
+This is demonstrated in the `hello-func.bpf.c` code where the `hello` program (which is attached
+to a raw tracepoint) calls the `get_opcode` function.
+
+Compile the program:
+
+```
+make
+```
+
+Load it:
+```
+bpftool prog load hello-func.bpf.o /sys/fs/bpf/hello
+```
+```
+bpftool prog list name hello
+```
+
+```
+150: raw_tracepoint  name hello  tag c86c2cef74f2057a  gpl
+        loaded_at 2023-09-14T08:39:08+0300  uid 0
+        xlated 120B  jited 88B  memlock 4096B  map_ids 5
+        btf_id 96
+root@habbes-ubuntu-v
+```
+
+Inspect the eBPF bytecode to see the `get_opcode` function
+
+```
+bpftool prog dump xlated name hello
+```
+
+```
+int hello(struct bpf_raw_tracepoint_args * ctx):
+; int opcode = get_opcode(ctx);
+   0: (85) call pc+12#bpf_prog_cbacc90865b1b9a5_get_opcode
+   1: (b7) r1 = 6563104
+; bpf_printk("Syscall: %d", opcode);
+   2: (63) *(u32 *)(r10 -8) = r1
+   3: (18) r1 = 0x3a6c6c6163737953
+   5: (7b) *(u64 *)(r10 -16) = r1
+   6: (bf) r1 = r10
+; 
+   7: (07) r1 += -16
+; bpf_printk("Syscall: %d", opcode);
+   8: (b7) r2 = 12
+   9: (bf) r3 = r0
+  10: (85) call bpf_trace_printk#-90784
+; return 0;
+  11: (b7) r0 = 0
+  12: (95) exit
+int get_opcode(struct bpf_raw_tracepoint_args * ctx):
+; return ctx->args[1];
+  13: (79) r0 = *(u64 *)(r1 +8)
+; return ctx->args[1];
+  14: (95) exit
+```
+
+The function call instruction (`0x85`) requires putting the current state on the
+eBPF VM stack so that when the called function exists, execution can continue in the
+caller. Since the stack size is limited to 512 bytes, BPF to BPF calls can't be very deeply nested.
